@@ -5,6 +5,9 @@ Setup for remote Access:
 Cadcraft_Blocks_attedit (PYTHON)
 <img width="1666" height="699" alt="image" src="https://github.com/user-attachments/assets/ea77b5a8-50b3-4071-9541-69bc8c253107" />
 
+cadcraft_apollonius_gui (PYTHON)
+<img width="1915" height="883" alt="image" src="https://github.com/user-attachments/assets/5faf285e-e447-4649-9e54-9e91b687b4b4" />
+
 CADCRAFT_BLOCKS_CSV (PYTHON)
 <img width="1571" height="1068" alt="image" src="https://github.com/user-attachments/assets/830feba0-2e29-4d71-82af-7d6ef43bb746" />
 
