@@ -56,8 +56,9 @@ CHPROP_LSP = r''';;; -----------------------------------------------------------
 ;;; Elevation, Width (global width) and CLosure (open/closed) are extras
 ;;; that apply to LWPOLYLINE objects only; other objects are skipped.
 ;;; Setting a global width removes any per-vertex widths.
-;;; Uses only core LISP functions (no vl-*, no getfiled, no entupdate:
-;;; CADCraft does not define ENTUPDATE; entmod alone applies the change).
+;;; Uses only core LISP functions (no vl-*, no getfiled, no entupdate,
+;;; no wcmatch: CADCraft lacks ENTUPDATE and wcmatch did not accept the
+;;; lineweight pattern).
 ;;; Note: loading this replaces any built-in CHPROP command in the
 ;;; current session.
 ;;; ------------------------------------------------------------------
@@ -200,7 +201,8 @@ CHPROP_LSP = r''';;; -----------------------------------------------------------
     ((or (= s "") (cp:kw s "BYLAYER" 3)) (cp:modify ss 370 -1))
     ((cp:kw s "BYBLOCK" 3)               (cp:modify ss 370 -2))
     ((cp:kw s "DEFAULT" 1)               (cp:modify ss 370 -3))
-    ((wcmatch s "[#.]*")
+    ((member (substr s 1 1)
+            '("0" "1" "2" "3" "4" "5" "6" "7" "8" "9" "."))
      (setq h (* 100.0 (atof s)) best (car lst))
      (foreach d lst
        (if (< (abs (- d h)) (abs (- best h))) (setq best d)))
