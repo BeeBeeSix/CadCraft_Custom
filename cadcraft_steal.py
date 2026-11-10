@@ -222,7 +222,9 @@ class Source:
         self.ltypes = {l.dxf.name: l for l in d.linetypes
                        if l.dxf.name.lower() not in BUILTIN_LTYPES}
         self.styles = {s.dxf.name: s for s in d.styles}
-        self.dimstyles = {s.dxf.name: s for s in d.dimstyles}
+        # dimension styles containing "$" (xref-bound copies) are ignored
+        self.dimstyles = {s.dxf.name: s for s in d.dimstyles
+                          if "$" not in s.dxf.name}
         self.blocks = {b.name: b for b in d.blocks
                        if not b.name.startswith("*")
                        and not (b.block.dxf.flags & 4)}   # skip xref blocks
