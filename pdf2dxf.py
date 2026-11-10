@@ -249,7 +249,7 @@ def build_dxf(pages, mapping, factor, unit, path, hatch=True, text=True, keep_wi
     made = {}
 
     def ltype_for(dash):
-        name = "PDF_" + "_".join(f"{round(v, 2):g}" for v in dash)
+        name = dash_name(dash)
         if name not in doc.linetypes:
             pat = [sum(dash) * factor] + [(v if i % 2 == 0 else -v) * factor for i, v in enumerate(dash)]
             doc.linetypes.add(name, pattern=pat, description="from PDF dash " + " ".join(f"{v:g}" for v in dash))
@@ -419,6 +419,125 @@ def run_cli(a):
         print(f"page {i + 1} -> {p}  factor={factor:.6g} {a.unit}/pt  {c}")
 
 
+def dash_name(dash):
+    return "PDF_" + "_".join(f"{round(v, 2):g}" for v in dash)
+
+
+def _seg_d2(p, a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    L = dx * dx + dy * dy
+    t = 0.0 if L == 0 else max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L))
+    qx, qy = a[0] + t * dx, a[1] + t * dy
+    return (p[0] - qx) ** 2 + (p[1] - qy) ** 2
+
+
+def _bbox(pr):
+    bb = pr.get("_bb")
+    if bb is None:
+        pts = pr["pts"] if pr["kind"] == "poly" else [q for sp in pr["paths"] for q in sp]
+        xs, ys = [q[0] for q in pts], [q[1] for q in pts]
+        bb = pr["_bb"] = (min(xs), min(ys), max(xs), max(ys))
+    return bb
+
+
+def _inside(p, paths):
+    """Even-odd point-in-polygon across all sub-paths."""
+    x, y = p
+    inside = False
+    for sp in paths:
+        n = len(sp)
+        for i in range(n):
+            x1, y1 = sp[i]
+            x2, y2 = sp[(i + 1) % n]
+            if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
+                inside = not inside
+    return inside
+
+
+def text_geom(pr):
+    """Unit direction d, unit 'up' u (view space, Y down) and estimated width of a text prim."""
+    a = math.radians(pr["angle"])
+    return (math.cos(a), -math.sin(a)), (-math.sin(a), -math.cos(a)), 0.5 * pr["size"] * len(pr["text"])
+
+
+def text_box(pr):
+    d, u, w = text_geom(pr)
+    s, (ox, oy) = pr["size"], pr["pos"]
+    return [(ox + lx * d[0] + ly * u[0], oy + lx * d[1] + ly * u[1])
+            for lx, ly in ((0, -0.25 * s), (w, -0.25 * s), (w, 0.9 * s), (0, 0.9 * s))]
+
+
+def _text_hit(pr, p, tol):
+    d, u, w = text_geom(pr)
+    s = pr["size"]
+    dx, dy = p[0] - pr["pos"][0], p[1] - pr["pos"][1]
+    lx, ly = dx * d[0] + dy * d[1], dx * u[0] + dy * u[1]
+    return -tol <= lx <= w + tol and -0.25 * s - tol <= ly <= 0.9 * s + tol
+
+
+def hit_prims(prims, pt, tol, mapping, only_used=True, hatch=True, text=True):
+    """Objects under view-space point `pt`: strokes/text (closest first), then fills (topmost first)."""
+    strokes, fills = [], []
+    for idx, pr in enumerate(prims):
+        if only_used:
+            m = mapping.get(pr["key"])
+            if m is not None and not m.get("use", True):
+                continue
+        k = pr["kind"]
+        if k == "poly":
+            t = max(tol, pr["width"] / 2)
+            x0, y0, x1, y1 = _bbox(pr)
+            if pt[0] < x0 - t or pt[0] > x1 + t or pt[1] < y0 - t or pt[1] > y1 + t:
+                continue
+            pts = pr["pts"]
+            n = len(pts) if pr["closed"] else len(pts) - 1
+            d2 = min(_seg_d2(pt, pts[i], pts[(i + 1) % len(pts)]) for i in range(n))
+            if d2 <= t * t:
+                strokes.append((d2, -idx))
+        elif k == "fill":
+            x0, y0, x1, y1 = _bbox(pr)
+            if hatch:
+                if x0 <= pt[0] <= x1 and y0 <= pt[1] <= y1 and _inside(pt, pr["paths"]):
+                    fills.append(idx)
+            elif pr["outline"]:
+                if pt[0] < x0 - tol or pt[0] > x1 + tol or pt[1] < y0 - tol or pt[1] > y1 + tol:
+                    continue
+                d2 = min(_seg_d2(pt, sp[i], sp[(i + 1) % len(sp)]) for sp in pr["paths"] for i in range(len(sp)))
+                if d2 <= tol * tol:
+                    strokes.append((d2, -idx))
+        elif k == "text" and text and _text_hit(pr, pt, tol):
+            strokes.append((0.0, -idx))
+    strokes.sort()
+    return [prims[-i] if i else prims[0] for _, i in strokes] + [prims[i] for i in sorted(fills, reverse=True)]
+
+
+def describe_hit(pr, mapping, factor, unit, hatch=True, suffix=False, dashes=True):
+    """Two-line description of an object: entity type, resulting layer, colour, details."""
+    m = mapping.get(pr["key"])
+    k = pr["kind"]
+    if k == "poly":
+        pts = pr["pts"]
+        is_line = len(pts) == 2 and not pr["closed"]
+        etype, suf = ("LINE", "_LINE") if is_line else ("PLINE", "_PLINE")
+        segs = len(pts) if pr["closed"] else len(pts) - 1
+        length = sum(math.dist(pts[i], pts[(i + 1) % len(pts)]) for i in range(segs)) * factor
+        detail = f"length {length:.4g} {unit} · {len(pts)} vertices" + (" · closed" if pr["closed"] else "")
+        if dashes and pr.get("dash"):
+            detail += f" · linetype {dash_name(pr['dash'])}"
+    elif k == "fill":
+        etype, suf = ("HATCH", "_HATCH") if hatch else ("PLINE", "_PLINE")
+        detail = f"{len(pr['paths'])} boundary path(s) · {sum(len(sp) for sp in pr['paths'])} vertices"
+    else:
+        etype, suf = "DTEXT", "_DTEXT"
+        t = pr["text"] if len(pr["text"]) <= 40 else pr["text"][:40] + "…"
+        detail = f'"{t}" · height {pr["size"] * 0.72 * factor:.4g} {unit}'
+    if m is None:
+        return f"{etype}  →  layer (unmapped)   colour {pr['key']}\n{detail}"
+    layer = clean_layer(m["layer"] + (suf if suffix else ""))
+    off = "   [Use is OFF – not exported]" if not m.get("use", True) else ""
+    return f"{etype}  →  layer {layer}   colour {pr['key']}{off}\n{detail}"
+
+
 def build_preview(rect, prims, mapping, hatch=True, text=True):
     """In-memory vector page showing only objects whose colour is enabled ('Use')."""
     doc = pymupdf.open()
@@ -476,6 +595,10 @@ def run_gui():
             self.swatches = {}
             self.q = queue.Queue()
             self.gen, self.pv_key, self.pv_doc = 0, None, None
+            self.sw = self.sh = 1
+            self._redraw_job = None
+            self.tool, self._zs, self._rp = None, None, (0, 0, False)
+            self.hit, self.hit_list, self.hit_pos, self.hit_idx, self._hit_page = None, [], None, 0, None
             self._build()
 
         # ---------- layout
@@ -501,6 +624,10 @@ def run_gui():
                             command=self.render).pack(side="left")
             ttk.Radiobutton(top, text="Original PDF", variable=self.var_view, value="pdf",
                             command=self.render).pack(side="left")
+            self.var_query = tk.BooleanVar(value=False)
+            ttk.Button(top, text="Zoom window (Z)", command=lambda: self.set_tool("zoom")).pack(side="left", padx=(12, 2))
+            ttk.Checkbutton(top, text="Query layer (Q)", style="Toolbutton", variable=self.var_query,
+                            command=lambda: self.set_tool("query" if self.var_query.get() else None)).pack(side="left")
             self.lbl_cursor = ttk.Label(top, text="")
             self.lbl_cursor.pack(side="right")
 
@@ -512,16 +639,28 @@ def run_gui():
             self.canvas = tk.Canvas(left, bg="#666", highlightthickness=0, cursor="crosshair")
             hs = ttk.Scrollbar(left, orient="horizontal", command=self.canvas.xview)
             vs = ttk.Scrollbar(left, orient="vertical", command=self.canvas.yview)
-            self.canvas.configure(xscrollcommand=hs.set, yscrollcommand=vs.set)
+            self.canvas.configure(xscrollcommand=lambda a, b: (hs.set(a, b), self.schedule_redraw()),
+                                  yscrollcommand=lambda a, b: (vs.set(a, b), self.schedule_redraw()))
             hs.pack(side="bottom", fill="x")
             vs.pack(side="right", fill="y")
+            self.lbl_query = ttk.Label(left, text="Query: pick 'Query layer' (Q), then click an object.\n ",
+                                       anchor="w", justify="left")
+            self.lbl_query.pack(side="bottom", fill="x", padx=4)
             self.canvas.pack(fill="both", expand=True)
             self.canvas.bind("<Button-1>", self.on_click)
             self.canvas.bind("<Motion>", self.on_motion)
             self.canvas.bind("<ButtonPress-2>", lambda e: self.canvas.scan_mark(e.x, e.y))
             self.canvas.bind("<B2-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
-            self.canvas.bind("<ButtonPress-3>", lambda e: self.canvas.scan_mark(e.x, e.y))
-            self.canvas.bind("<B3-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
+            self.canvas.bind("<ButtonPress-3>", self.on_rpress)      # right-drag = pan, right-click = menu
+            self.canvas.bind("<B3-Motion>", self.on_rdrag)
+            self.canvas.bind("<ButtonRelease-3>", self.on_rrelease)
+            self.canvas.bind("<B1-Motion>", self.on_drag)
+            self.canvas.bind("<ButtonRelease-1>", self.on_release)
+            self.canvas.bind("<Configure>", lambda e: self.schedule_redraw())
+            self.canvas.bind("<Enter>", lambda e: self.canvas.focus_set())
+            self.canvas.bind("<Key-z>", lambda e: self.set_tool("zoom"))
+            self.canvas.bind("<Key-q>", lambda e: self.set_tool(None if self.tool == "query" else "query"))
+            self.canvas.bind("<Escape>", lambda e: self.escape())
             self.canvas.bind("<MouseWheel>", self.on_wheel)
             self.canvas.bind("<Button-4>", lambda e: self.on_wheel(e, 1))
             self.canvas.bind("<Button-5>", lambda e: self.on_wheel(e, -1))
@@ -638,6 +777,7 @@ def run_gui():
             self.path = p
             self.cache.clear()
             self.pv_key, self.pv_doc = None, None
+            self.hit, self.hit_list = None, []
             self.calib_pts = []
             self.lbl_file.config(text=f"{os.path.basename(p)}  ({len(self.doc)} pages)")
             self.var_page.set(1)
@@ -660,22 +800,67 @@ def run_gui():
             r = self.doc[self.page_idx()].rect
             cw, ch = max(self.canvas.winfo_width(), 200), max(self.canvas.winfo_height(), 200)
             self.zoom = min(cw / r.width, ch / r.height) * 0.97
-            self.render()
+            self.render(draw=False)
+            self.canvas.xview_moveto(0)
+            self.canvas.yview_moveto(0)
+            self.redraw_view()
 
-        def set_zoom(self, z):
-            self.zoom = max(0.1, min(z, 12))
-            self.render()
-
-        def render(self):
+        def set_zoom(self, z, sx=None, sy=None):
+            """Zoom keeping the view point under screen (sx, sy) fixed (default: canvas centre)."""
             if not self.doc:
                 return
-            pg = self.preview_page()
-            pix = pg.get_pixmap(matrix=pymupdf.Matrix(self.zoom, self.zoom), alpha=False)
-            self.img = tk.PhotoImage(data=pix.tobytes("png"))
-            self.canvas.delete("all")
-            self.canvas.create_image(0, 0, image=self.img, anchor="nw")
-            self.canvas.configure(scrollregion=(0, 0, pix.width, pix.height))
+            cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+            sx = cw / 2 if sx is None else sx
+            sy = ch / 2 if sy is None else sy
+            vx, vy = self.canvas.canvasx(sx) / self.zoom, self.canvas.canvasy(sy) / self.zoom
+            self.zoom = max(0.05, min(z, 400))
+            self.render(draw=False)
+            self.center_on(vx, vy, sx, sy)
+
+        def center_on(self, vx, vy, sx, sy):
+            """Scroll so view-space point (vx, vy) appears at screen position (sx, sy)."""
+            self.canvas.xview_moveto(max(0.0, (vx * self.zoom - sx) / max(self.sw, 1)))
+            self.canvas.yview_moveto(max(0.0, (vy * self.zoom - sy) / max(self.sh, 1)))
+            self.redraw_view()
+
+        def render(self, draw=True):
+            """Update scroll region and overlays for the current zoom/page; optionally redraw the raster."""
+            if not self.doc:
+                return
+            r = self.preview_page().rect
+            self.sw, self.sh = int(r.width * self.zoom) + 1, int(r.height * self.zoom) + 1
+            self.canvas.configure(scrollregion=(0, 0, self.sw, self.sh))
             self.draw_calib()
+            self.draw_hit()
+            if draw:
+                self.redraw_view()
+
+        def schedule_redraw(self):
+            if self._redraw_job:
+                self.canvas.after_cancel(self._redraw_job)
+            self._redraw_job = self.canvas.after(15, self.redraw_view)
+
+        def redraw_view(self):
+            """Rasterise only the visible part of the page (keeps memory flat at any zoom)."""
+            if self._redraw_job:
+                self.canvas.after_cancel(self._redraw_job)
+                self._redraw_job = None
+            if not self.doc:
+                return
+            pg, z = self.preview_page(), self.zoom
+            cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+            x0, y0 = max(0, self.canvas.canvasx(0)), max(0, self.canvas.canvasy(0))
+            x1, y1 = min(self.sw, x0 + cw), min(self.sh, y0 + ch)
+            if x1 <= x0 or y1 <= y0:
+                return
+            clip = pymupdf.Rect(x0 / z, y0 / z, x1 / z, y1 / z) & pg.rect
+            if clip.is_empty:
+                return
+            pix = pg.get_pixmap(matrix=pymupdf.Matrix(z, z), clip=clip, alpha=False)
+            self.img = tk.PhotoImage(data=pix.tobytes("png"))
+            self.canvas.delete("img")
+            self.canvas.create_image(pix.x, pix.y, image=self.img, anchor="nw", tags="img")
+            self.canvas.tag_lower("img")
 
         def preview_page(self):
             i = self.page_idx()
@@ -694,9 +879,135 @@ def run_gui():
             if d is None:
                 d = 1 if e.delta > 0 else -1
             if e.state & 0x4:  # ctrl
-                self.set_zoom(self.zoom * (1.15 if d > 0 else 1 / 1.15))
+                self.set_zoom(self.zoom * (1.15 if d > 0 else 1 / 1.15), e.x, e.y)
             else:
                 self.canvas.yview_scroll(-d * 3, "units")
+
+        # ---------- tools: zoom window, right-click menu, query
+        def set_tool(self, tool):
+            self.tool, self._zs = tool, None
+            self.canvas.delete("zoombox")
+            if tool:
+                self.picking = False
+            self.var_query.set(tool == "query")
+            self.canvas.config(cursor={"zoom": "sizing", "query": "question_arrow"}.get(tool, "crosshair"))
+            if tool == "zoom":
+                self.status.config(text="Zoom window: drag a rectangle on the preview (Esc cancels).")
+            elif tool == "query":
+                self.status.config(text="Query: click an object to see its layer; click again at the same spot "
+                                        "to cycle overlapping objects. Esc exits.")
+
+        def escape(self):
+            self.set_tool(None)
+            self.hit = None
+            self.draw_hit()
+            self.lbl_query.config(text="Query: pick 'Query layer' (Q), then click an object.\n ")
+
+        def on_drag(self, e):
+            if self.tool == "zoom" and self._zs:
+                self.canvas.delete("zoombox")
+                self.canvas.create_rectangle(self._zs[0], self._zs[1], self.canvas.canvasx(e.x),
+                                             self.canvas.canvasy(e.y), outline="#06f", dash=(5, 3),
+                                             width=2, tags="zoombox")
+
+        def on_release(self, e):
+            if self.tool != "zoom" or not self._zs:
+                return
+            x0, y0 = self._zs
+            x1, y1 = self.canvas.canvasx(e.x), self.canvas.canvasy(e.y)
+            self.set_tool(None)
+            if abs(x1 - x0) >= 6 and abs(y1 - y0) >= 6:
+                z = self.zoom
+                self.zoom_rect(x0 / z, y0 / z, x1 / z, y1 / z)
+
+        def zoom_rect(self, x0, y0, x1, y1):
+            """Zoom so the view-space rectangle fills the canvas."""
+            w, h = max(abs(x1 - x0), 1e-6), max(abs(y1 - y0), 1e-6)
+            cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+            self.zoom = max(0.05, min(min(cw / w, ch / h) * 0.96, 400))
+            self.render(draw=False)
+            self.center_on((x0 + x1) / 2, (y0 + y1) / 2, cw / 2, ch / 2)
+
+        def on_rpress(self, e):
+            self.canvas.scan_mark(e.x, e.y)
+            self._rp = (e.x, e.y, False)
+
+        def on_rdrag(self, e):
+            x, y, moved = self._rp
+            if not moved and abs(e.x - x) + abs(e.y - y) < 5:
+                return
+            self._rp = (x, y, True)
+            self.canvas.scan_dragto(e.x, e.y, gain=1)
+
+        def on_rrelease(self, e):
+            if self._rp[2] or not self.doc:
+                return
+            m = tk.Menu(self.canvas, tearoff=0)
+            m.add_command(label="Zoom window", command=lambda: self.set_tool("zoom"))
+            m.add_command(label="Query layer here", command=lambda: self.query_at(e.x, e.y))
+            m.add_separator()
+            m.add_command(label="Zoom in here", command=lambda: self.set_zoom(self.zoom * 1.5, e.x, e.y))
+            m.add_command(label="Zoom out", command=lambda: self.set_zoom(self.zoom / 1.5, e.x, e.y))
+            m.add_command(label="Fit page", command=self.fit)
+            m.tk_popup(e.x_root, e.y_root)
+
+        def query_at(self, sx, sy):
+            """Show the layer / entity type of the object under screen point (sx, sy)."""
+            if not self.doc:
+                return
+            cx, cy = self.canvas.canvasx(sx), self.canvas.canvasy(sy)
+            i = self.page_idx()
+            same = (self.hit_list and self._hit_page == i and self.hit_pos
+                    and abs(self.hit_pos[0] - cx) < 4 and abs(self.hit_pos[1] - cy) < 4)
+            if same:
+                self.hit_idx = (self.hit_idx + 1) % len(self.hit_list)
+            else:
+                prims, _ = self.get_page_data(i)
+                self.hit_list = hit_prims(prims, (cx / self.zoom, cy / self.zoom), 6 / self.zoom, self.mapping,
+                                          self.var_view.get() == "layers", self.var_hatch.get(), self.var_text.get())
+                self.hit_idx, self.hit_pos = 0, (cx, cy)
+            self._hit_page = i
+            if not self.hit_list:
+                self.hit = None
+                self.draw_hit()
+                self.lbl_query.config(text="Query: nothing under the cursor.\n ")
+                return
+            self.hit = self.hit_list[self.hit_idx]
+            self.draw_hit()
+            n = len(self.hit_list)
+            info = describe_hit(self.hit, self.mapping, self.factor, self.var_unit.get(), self.var_hatch.get(),
+                                self.var_suffix.get(), self.var_dash.get())
+            more = f"      [{self.hit_idx + 1} of {n} here – click again to cycle]" if n > 1 else ""
+            first, second = info.split("\n")
+            self.lbl_query.config(text=f"{first}{more}\n{second}")
+            key = self.hit["key"]
+            if self.tree.exists(key):
+                self.tree.selection_set(key)
+                self.tree.see(key)
+
+        def draw_hit(self):
+            self.canvas.delete("hit")
+            pr = self.hit
+            if not pr or not self.doc or self._hit_page != self.page_idx():
+                return
+            if self.var_view.get() == "layers" and not self.mapping.get(pr["key"], {}).get("use", True):
+                return
+            z = self.zoom
+
+            def line(pts, close):
+                c = [v * z for q in pts for v in q]
+                if close:
+                    c += c[:2]
+                if len(c) >= 4:
+                    self.canvas.create_line(*c, fill="#ff00ff", width=3, tags="hit")
+
+            if pr["kind"] == "poly":
+                line(pr["pts"], pr["closed"])
+            elif pr["kind"] == "fill":
+                for sp in pr["paths"]:
+                    line(sp, True)
+            else:
+                line(text_box(pr), True)
 
         # ---------- picking / calibration
         def view_pt(self, e):
@@ -735,13 +1046,23 @@ def run_gui():
         def start_pick(self):
             if not self.doc:
                 return
+            self.set_tool(None)
             self.calib_pts = []
             self.picking = True
             self.render()
             self.status.config(text="Click the FIRST point of a known distance (snaps to vertices).")
 
         def on_click(self, e):
-            if not (self.picking and self.doc):
+            if not self.doc:
+                return
+            self.canvas.focus_set()
+            if self.tool == "zoom":
+                self._zs = (self.canvas.canvasx(e.x), self.canvas.canvasy(e.y))
+                return
+            if self.tool == "query":
+                self.query_at(e.x, e.y)
+                return
+            if not self.picking:
                 return
             self.calib_pts.append(self.snap(self.view_pt(e)))
             self.draw_calib()
@@ -830,6 +1151,7 @@ def run_gui():
                 m = self.mapping[k]
                 self.tree.insert("", "end", iid=k, text=" " + k, image=self.swatch(k),
                                  values=("✔" if m["use"] else "–", n, m["layer"]))
+            self.hit_list = []
             if self.doc:
                 self.render()
 
