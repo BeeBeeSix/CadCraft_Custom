@@ -6,6 +6,7 @@ GUI :  python pdf2dxf.py                (or --gui)
 CLI :  python pdf2dxf.py in.pdf out.dxf --ratio 100 --unit m --map map.json
        python pdf2dxf.py in.pdf out.dxf --calib 120.5,300,480.2,300,25.0 --unit m
        python pdf2dxf.py in.pdf --list-colours --write-map map.json
+       python pdf2dxf.py pdf_folder/ dxf_folder/ --ratio 100 --unit m --recursive --suffix   (batch)
 
 Requires:  pip install pymupdf ezdxf        (tkinter for the GUI)
 
@@ -27,6 +28,7 @@ except ImportError:  # older PyMuPDF
     import fitz as pymupdf
 import ezdxf
 from ezdxf import colors as ezcolors
+from ezdxf.lldxf.const import LWPOLYLINE_PLINEGEN
 
 # --------------------------------------------------------------------------- core
 UNITS = {            # name: (mm per unit, DXF $INSUNITS code)
@@ -164,6 +166,24 @@ def _subpaths(items, segs, tf):
     return subs
 
 
+def parse_dash(s):
+    """PyMuPDF dash string '[3 2] 0' -> tuple of on/off lengths in pt (even count), or None."""
+    if not s:
+        return None
+    m = re.match(r"\s*\[([^\]]*)\]", s)
+    if not m:
+        return None
+    try:
+        v = [float(x) for x in m.group(1).split()]
+    except ValueError:
+        return None
+    if not v or sum(v) <= 0:
+        return None
+    if len(v) % 2:
+        v = v * 2
+    return tuple(v)
+
+
 def extract_page(page, segs=12, text=True):
     """Return (primitives, view_height). Primitives are in view space (pt, Y down)."""
     m = page.rotation_matrix
@@ -187,13 +207,15 @@ def extract_page(page, segs=12, text=True):
         if not subs:
             continue
         w = d.get("width") or 0.0
-        if stroke:
-            for pts, closed in subs:
-                prims.append({"kind": "poly", "pts": pts, "closed": closed, "key": stroke, "width": w})
+        dash = parse_dash(d.get("dashes"))
         if fill:
             closed_subs = [pts for pts, _ in subs if len(pts) >= 3]
             if closed_subs:
                 prims.append({"kind": "fill", "paths": closed_subs, "key": fill, "outline": not stroke})
+        if stroke:
+            for pts, closed in subs:
+                prims.append({"kind": "poly", "pts": pts, "closed": closed, "key": stroke,
+                              "width": w, "dash": dash})
 
     if text:
         for b in page.get_text("dict").get("blocks", []):
@@ -218,7 +240,7 @@ def default_mapping(keys, prefix="C_"):
 
 
 def build_dxf(pages, mapping, factor, unit, path, hatch=True, text=True, keep_widths=False,
-              aci=False, lines_as_line=True):
+              aci=False, lines_as_line=True, dashes=True, suffix=False):
     """pages: list of (prims, view_height). Writes `path` (first page only per file)."""
     prims, H = pages
     doc = ezdxf.new("R2010", setup=True)
@@ -226,11 +248,16 @@ def build_dxf(pages, mapping, factor, unit, path, hatch=True, text=True, keep_wi
     msp = doc.modelspace()
     made = {}
 
-    def layer_for(key):
-        m = mapping.get(key)
-        if not m or not m.get("use", True):
-            return None
-        name = clean_layer(m["layer"])
+    def ltype_for(dash):
+        name = "PDF_" + "_".join(f"{round(v, 2):g}" for v in dash)
+        if name not in doc.linetypes:
+            pat = [sum(dash) * factor] + [(v if i % 2 == 0 else -v) * factor for i, v in enumerate(dash)]
+            doc.linetypes.add(name, pattern=pat, description="from PDF dash " + " ".join(f"{v:g}" for v in dash))
+        return name
+
+    def layer_for(key, suf=""):
+        m = mapping[key]
+        name = clean_layer(m["layer"] + (suf if suffix else ""))
         if name not in made:
             if name not in doc.layers:
                 lay = doc.layers.add(name)
@@ -246,35 +273,40 @@ def build_dxf(pages, mapping, factor, unit, path, hatch=True, text=True, keep_wi
 
     counts = {"poly": 0, "line": 0, "hatch": 0, "text": 0}
     for pr in prims:
-        layer = layer_for(pr["key"])
-        if layer is None:
+        m = mapping.get(pr["key"])
+        if not m or not m.get("use", True):
             continue
-        attr = {"layer": layer}
         if pr["kind"] == "poly":
             pts = [P(p) for p in pr["pts"]]
-            if lines_as_line and len(pts) == 2 and not pr["closed"]:
+            is_line = lines_as_line and len(pts) == 2 and not pr["closed"]
+            attr = {"layer": layer_for(pr["key"], "_LINE" if is_line else "_PLINE")}
+            if dashes and pr.get("dash"):
+                attr["linetype"] = ltype_for(pr["dash"])
+            if is_line:
                 msp.add_line(pts[0], pts[1], dxfattribs=attr)
                 counts["line"] += 1
             else:
-                a = dict(attr)
                 if keep_widths and pr["width"] > 0:
-                    a["const_width"] = pr["width"] * factor
-                msp.add_lwpolyline(pts, close=pr["closed"], dxfattribs=a)
+                    attr["const_width"] = pr["width"] * factor
+                e = msp.add_lwpolyline(pts, close=pr["closed"], dxfattribs=attr)
+                if "linetype" in attr:  # continuous pattern across vertices
+                    e.dxf.flags = e.dxf.flags | LWPOLYLINE_PLINEGEN
                 counts["poly"] += 1
         elif pr["kind"] == "fill":
             if hatch:
-                h = msp.add_hatch(dxfattribs=attr)
+                h = msp.add_hatch(dxfattribs={"layer": layer_for(pr["key"], "_HATCH")})
                 h.set_solid_fill(color=256)
                 for sp in pr["paths"]:
                     h.paths.add_polyline_path([P(p) for p in sp], is_closed=True)
                 counts["hatch"] += 1
             elif pr["outline"]:
+                attr = {"layer": layer_for(pr["key"], "_PLINE")}
                 for sp in pr["paths"]:
                     msp.add_lwpolyline([P(p) for p in sp], close=True, dxfattribs=attr)
                     counts["poly"] += 1
         elif pr["kind"] == "text" and text:
             t = msp.add_text(pr["text"], height=max(pr["size"] * 0.72 * factor, 1e-9),
-                             rotation=pr["angle"], dxfattribs=attr)
+                             rotation=pr["angle"], dxfattribs={"layer": layer_for(pr["key"], "_DTEXT")})
             t.dxf.insert = P(pr["pos"])
             counts["text"] += 1
     doc.saveas(path)
@@ -296,8 +328,66 @@ def out_paths(out, idxs):
     return {i: f"{base}_p{i + 1}{ext or '.dxf'}" for i in idxs}
 
 
+def convert_pdf(pdf, out, mapping, factor, unit, pages="all", segs=12, **build_kw):
+    """Convert one PDF (all/selected pages). Colours missing from `mapping` get default layers."""
+    doc = pymupdf.open(pdf)
+    res = []
+    try:
+        idxs = parse_pages(pages, len(doc))
+        for i, p in out_paths(out, idxs).items():
+            data = extract_page(doc[i], segs, build_kw.get("text", True))
+            for k in {pr["key"] for pr in data[0]}:
+                mapping.setdefault(k, default_mapping([k])[k])
+            res.append((i + 1, p, build_dxf(data, mapping, factor, unit, p, **build_kw)))
+    finally:
+        doc.close()
+    return res
+
+
+def batch_convert(src, dst, recursive, mapping, factor, unit, log=print, **kw):
+    """Convert every PDF in src (optionally recursive) into dst, mirroring sub-folders."""
+    files = []
+    if recursive:
+        for root, _, names in os.walk(src):
+            files += [os.path.join(root, n) for n in names if n.lower().endswith(".pdf")]
+    else:
+        files = [os.path.join(src, n) for n in os.listdir(src) if n.lower().endswith(".pdf")]
+    files.sort()
+    ok, errs = 0, []
+    for n, f in enumerate(files, 1):
+        rel = os.path.relpath(os.path.splitext(f)[0] + ".dxf", src)
+        out = os.path.join(dst, rel)
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        log(f"[{n}/{len(files)}] {rel}")
+        try:
+            convert_pdf(f, out, mapping, factor, unit, **kw)
+            ok += 1
+        except Exception as ex:
+            errs.append(f"{os.path.relpath(f, src)}: {ex}")
+    summary = f"Batch done: {ok} of {len(files)} file(s) converted to {dst}"
+    if errs:
+        summary += f"\n{len(errs)} failed:\n" + "\n".join(errs[:8])
+    return summary
+
+
 # --------------------------------------------------------------------------- CLI
+def run_cli_batch(a):
+    mapping = {}
+    if a.map and os.path.exists(a.map):
+        mapping.update(json.load(open(a.map, encoding="utf-8")))
+    if a.calib:
+        sys.exit("--calib is per-drawing; use --ratio or --factor for batch")
+    factor = ratio_factor(a.ratio, a.unit) if a.ratio else (a.factor or 1.0)
+    print(batch_convert(a.pdf, a.out or a.pdf, a.recursive, mapping, factor, a.unit, pages=a.pages,
+                        segs=a.segments, text=not a.no_text, hatch=a.hatch, keep_widths=a.widths,
+                        aci=a.aci, dashes=not a.no_dashes, suffix=a.suffix))
+    if a.write_map:
+        json.dump(mapping, open(a.write_map, "w", encoding="utf-8"), indent=2)
+
+
 def run_cli(a):
+    if os.path.isdir(a.pdf):
+        return run_cli_batch(a)
     doc = pymupdf.open(a.pdf)
     idxs = parse_pages(a.pages, len(doc))
     data = {i: extract_page(doc[i], a.segments, not a.no_text) for i in idxs}
@@ -325,8 +415,44 @@ def run_cli(a):
         factor = 1.0
     for i, p in out_paths(a.out, idxs).items():
         c = build_dxf(data[i], mapping, factor, a.unit, p, hatch=a.hatch, text=not a.no_text,
-                      keep_widths=a.widths, aci=a.aci)
+                      keep_widths=a.widths, aci=a.aci, dashes=not a.no_dashes, suffix=a.suffix)
         print(f"page {i + 1} -> {p}  factor={factor:.6g} {a.unit}/pt  {c}")
+
+
+def build_preview(rect, prims, mapping, hatch=True, text=True):
+    """In-memory vector page showing only objects whose colour is enabled ('Use')."""
+    doc = pymupdf.open()
+    pg = doc.new_page(width=rect.width, height=rect.height)
+    sh = pg.new_shape()
+    for pr in prims:
+        m = mapping.get(pr["key"])
+        if m is not None and not m.get("use", True):
+            continue
+        col = tuple(v / 255 for v in hex_to_rgb(pr["key"]))
+        k = pr["kind"]
+        if k == "poly":
+            dash = pr.get("dash")
+            sh.draw_polyline(pr["pts"])
+            sh.finish(color=col, fill=None, width=max(pr["width"], 0.3), closePath=pr["closed"],
+                      dashes=("[%s] 0" % " ".join(f"{v:g}" for v in dash)) if dash else None)
+        elif k == "fill":
+            if hatch:
+                for sp in pr["paths"]:
+                    sh.draw_polyline(sp)
+                sh.finish(color=None, fill=col, even_odd=True, closePath=True)
+            elif pr["outline"]:
+                for sp in pr["paths"]:
+                    sh.draw_polyline(sp)
+                    sh.finish(color=col, fill=None, width=0.3, closePath=True)
+        elif k == "text" and text:
+            try:
+                pos = pymupdf.Point(*pr["pos"])
+                sh.insert_text(pos, pr["text"], fontsize=pr["size"], color=col,
+                               morph=(pos, pymupdf.Matrix(pr["angle"])))
+            except Exception:
+                pass
+    sh.commit()
+    return doc
 
 
 # --------------------------------------------------------------------------- GUI
@@ -349,6 +475,7 @@ def run_gui():
             self.factor = 1.0
             self.swatches = {}
             self.q = queue.Queue()
+            self.gen, self.pv_key, self.pv_doc = 0, None, None
             self._build()
 
         # ---------- layout
@@ -368,6 +495,12 @@ def run_gui():
             ttk.Button(top, text="Fit", command=self.fit).pack(side="left", padx=2)
             self.var_snap = tk.BooleanVar(value=True)
             ttk.Checkbutton(top, text="Snap to vertices", variable=self.var_snap).pack(side="left", padx=12)
+            self.var_view = tk.StringVar(value="layers")
+            ttk.Label(top, text="View").pack(side="left", padx=(4, 2))
+            ttk.Radiobutton(top, text="Layers (Use only)", variable=self.var_view, value="layers",
+                            command=self.render).pack(side="left")
+            ttk.Radiobutton(top, text="Original PDF", variable=self.var_view, value="pdf",
+                            command=self.render).pack(side="left")
             self.lbl_cursor = ttk.Label(top, text="")
             self.lbl_cursor.pack(side="right")
 
@@ -466,6 +599,10 @@ def run_gui():
             self.var_widths = tk.BooleanVar(value=False)
             self.var_aci = tk.BooleanVar(value=False)
             self.var_segs = tk.IntVar(value=12)
+            self.var_dash = tk.BooleanVar(value=True)
+            self.var_suffix = tk.BooleanVar(value=False)
+            self.var_hatch.trace_add("write", lambda *a: self.render())
+            self.var_text.trace_add("write", lambda *a: self.render())
             g = ttk.Frame(of)
             g.pack(fill="x")
             ttk.Label(g, text="Pages (e.g. 1,3-5)").grid(row=0, column=0, sticky="w")
@@ -476,9 +613,14 @@ def run_gui():
             ttk.Checkbutton(of, text="Filled areas as solid HATCH (else outlines only)", variable=self.var_hatch).pack(anchor="w")
             ttk.Checkbutton(of, text="Keep stroke widths (polyline constant width)", variable=self.var_widths).pack(anchor="w")
             ttk.Checkbutton(of, text="Layer colour = nearest ACI index (else true colour)", variable=self.var_aci).pack(anchor="w")
+            ttk.Checkbutton(of, text="Dash patterns → linetypes (PDF_4_2 …)", variable=self.var_dash).pack(anchor="w")
+            ttk.Checkbutton(of, text="Add entity type to layer name  (_LINE, _PLINE, _HATCH, _DTEXT)",
+                            variable=self.var_suffix).pack(anchor="w")
 
             self.btn_conv = ttk.Button(right, text="Convert → DXF…", command=self.convert)
             self.btn_conv.pack(fill="x", pady=4)
+            self.btn_batch = ttk.Button(right, text="Batch folder…", command=self.batch)
+            self.btn_batch.pack(fill="x")
             self.status = ttk.Label(right, text="Open a PDF to begin.", wraplength=520, foreground="#333")
             self.status.pack(anchor="w")
             self.update_factor()
@@ -495,12 +637,13 @@ def run_gui():
                 return
             self.path = p
             self.cache.clear()
+            self.pv_key, self.pv_doc = None, None
             self.calib_pts = []
             self.lbl_file.config(text=f"{os.path.basename(p)}  ({len(self.doc)} pages)")
             self.var_page.set(1)
             self.root.update_idletasks()
-            self.fit()
             self.scan()
+            self.fit()
 
         def page_idx(self):
             n = len(self.doc)
@@ -526,13 +669,26 @@ def run_gui():
         def render(self):
             if not self.doc:
                 return
-            pg = self.doc[self.page_idx()]
+            pg = self.preview_page()
             pix = pg.get_pixmap(matrix=pymupdf.Matrix(self.zoom, self.zoom), alpha=False)
             self.img = tk.PhotoImage(data=pix.tobytes("png"))
             self.canvas.delete("all")
             self.canvas.create_image(0, 0, image=self.img, anchor="nw")
             self.canvas.configure(scrollregion=(0, 0, pix.width, pix.height))
             self.draw_calib()
+
+        def preview_page(self):
+            i = self.page_idx()
+            if self.var_view.get() != "layers":
+                return self.doc[i]
+            prims, _ = self.get_page_data(i)
+            used = tuple(sorted(k for k, m in self.mapping.items() if m.get("use", True)))
+            key = (i, self.gen, used, self.var_hatch.get(), self.var_text.get())
+            if key != self.pv_key:
+                self.pv_doc = build_preview(self.doc[i].rect, prims, self.mapping,
+                                            self.var_hatch.get(), self.var_text.get())
+                self.pv_key = key
+            return self.pv_doc[0]
 
         def on_wheel(self, e, d=None):
             if d is None:
@@ -553,6 +709,8 @@ def run_gui():
             prims, _ = self.get_page_data(self.page_idx())
             best, bd = None, (10 / self.zoom) ** 2
             for pr in prims:
+                if self.var_view.get() == "layers" and not self.mapping.get(pr["key"], {}).get("use", True):
+                    continue
                 if pr["kind"] == "poly":
                     seq = pr["pts"]
                 elif pr["kind"] == "fill":
@@ -652,6 +810,7 @@ def run_gui():
             self.root.update_idletasks()
             try:
                 self.cache.clear()
+                self.gen += 1
                 idxs = parse_pages(self.var_pages.get(), len(self.doc))
                 data = [self.get_page_data(i) for i in idxs]
                 self.counts = scan_colours(data)
@@ -671,6 +830,8 @@ def run_gui():
                 m = self.mapping[k]
                 self.tree.insert("", "end", iid=k, text=" " + k, image=self.swatch(k),
                                  values=("✔" if m["use"] else "–", n, m["layer"]))
+            if self.doc:
+                self.render()
 
         def on_tree_dbl(self, e):
             iid = self.tree.identify_row(e.y)
@@ -739,9 +900,11 @@ def run_gui():
             idxs = parse_pages(self.var_pages.get(), len(self.doc))
             data = {i: self.get_page_data(i) for i in idxs}
             args = dict(factor=self.factor, unit=self.var_unit.get(), hatch=self.var_hatch.get(),
-                        text=self.var_text.get(), keep_widths=self.var_widths.get(), aci=self.var_aci.get())
+                        text=self.var_text.get(), keep_widths=self.var_widths.get(), aci=self.var_aci.get(),
+                        dashes=self.var_dash.get(), suffix=self.var_suffix.get())
             mapping = {k: dict(v) for k, v in self.mapping.items()}
             self.btn_conv.state(["disabled"])
+            self.btn_batch.state(["disabled"])
             self.status.config(text="Converting…")
 
             def work():
@@ -757,18 +920,66 @@ def run_gui():
             threading.Thread(target=work, daemon=True).start()
             self.root.after(100, self.poll)
 
-        def poll(self):
-            try:
-                kind, msg = self.q.get_nowait()
-            except queue.Empty:
-                self.root.after(100, self.poll)
+        def batch(self):
+            self.update_factor()
+            if self.var_mode.get() == "calib" and not hasattr(self, "calib_factor"):
+                messagebox.showwarning("Scale", "Pick two calibration points first.")
                 return
-            self.btn_conv.state(["!disabled"])
-            if kind == "ok":
-                self.status.config(text="Done.\n" + msg)
-            else:
-                self.status.config(text="Error: " + msg)
-                messagebox.showerror("Conversion failed", msg)
+            if not self.factor:
+                messagebox.showwarning("Scale", "Scale is not valid.")
+                return
+            src = filedialog.askdirectory(title="Folder containing PDFs")
+            if not src:
+                return
+            dst = filedialog.askdirectory(title="Output folder for DXF files", initialdir=src)
+            if not dst:
+                return
+            rec = messagebox.askyesno("Batch", "Include sub-folders?")
+            unit, factor = self.var_unit.get(), self.factor
+            if not messagebox.askokcancel(
+                    "Batch", f"Every PDF will use the current scale:\n1 PDF pt = {factor:.6g} {unit}\n\n"
+                             f"the current colour → layer map (new colours get default names),\n"
+                             f"export options and page selection ({self.var_pages.get()}).\n\nProceed?"):
+                return
+            kw = dict(pages=self.var_pages.get(), segs=self.var_segs.get(), text=self.var_text.get(),
+                      hatch=self.var_hatch.get(), keep_widths=self.var_widths.get(), aci=self.var_aci.get(),
+                      dashes=self.var_dash.get(), suffix=self.var_suffix.get())
+            mapping = {k: dict(v) for k, v in self.mapping.items()}
+            self.btn_conv.state(["disabled"])
+            self.btn_batch.state(["disabled"])
+
+            def work():
+                try:
+                    msg = batch_convert(src, dst, rec, mapping, factor, unit,
+                                        log=lambda m: self.q.put(("log", m)), **kw)
+                    self.q.put(("ok", msg))
+                except Exception as ex:
+                    self.q.put(("err", str(ex)))
+
+            threading.Thread(target=work, daemon=True).start()
+            self.root.after(100, self.poll)
+
+        def poll(self):
+            last = None
+            while True:
+                try:
+                    kind, msg = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "log":
+                    last = msg
+                    continue
+                self.btn_conv.state(["!disabled"])
+                self.btn_batch.state(["!disabled"])
+                if kind == "ok":
+                    self.status.config(text="Done.\n" + msg)
+                else:
+                    self.status.config(text="Error: " + msg)
+                    messagebox.showerror("Conversion failed", msg)
+                return
+            if last:
+                self.status.config(text=last)
+            self.root.after(100, self.poll)
 
     root = tk.Tk()
     App(root)
@@ -778,8 +989,8 @@ def run_gui():
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description="Vector PDF -> DXF with colour->layer mapping and scale calibration")
-    ap.add_argument("pdf", nargs="?")
-    ap.add_argument("out", nargs="?")
+    ap.add_argument("pdf", nargs="?", help="PDF file, or a folder for batch mode")
+    ap.add_argument("out", nargs="?", help="output .dxf (or output folder in batch mode)")
     ap.add_argument("--gui", action="store_true")
     ap.add_argument("--pages", default="all")
     ap.add_argument("--unit", default="m", choices=list(UNITS))
@@ -794,6 +1005,9 @@ def main():
     ap.add_argument("--hatch", action="store_true", help="fills as HATCH")
     ap.add_argument("--widths", action="store_true", help="keep stroke widths")
     ap.add_argument("--aci", action="store_true", help="layer colours as nearest ACI")
+    ap.add_argument("--suffix", action="store_true", help="append _LINE/_PLINE/_HATCH/_DTEXT to layer names")
+    ap.add_argument("--no-dashes", action="store_true", help="do not create linetypes from dash patterns")
+    ap.add_argument("--recursive", action="store_true", help="batch: include sub-folders")
     a = ap.parse_args()
     if a.gui or not a.pdf:
         run_gui()
